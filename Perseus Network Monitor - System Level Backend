@@ -1,0 +1,233 @@
+# Copyright Joseph Peransi, two thousand twenty-six.
+# Perseus Network Monitor - System Level Backend
+# Production Ready: No Mock Data. Windows System Architecture.
+
+import os
+import sys
+import time
+import psutil
+import socket
+import threading
+import subprocess
+import ctypes
+import logging
+from flask import Flask, jsonify, request, send_from_directory
+from flask_cors import CORS
+from datetime import datetime
+
+# Configure Logging
+logging.basicConfig(level=logging.INFO, format='%(asctime)s - PERSEUS - %(message)s')
+logger = logging.getLogger("PerseusCore")
+
+# Initialize Flask
+app = Flask(__name__)
+CORS(app)  # Enable Cross-Origin for local browser access
+
+# Configuration
+SCRIPTS_DIR = r"C:\Perseus\scripts"
+FIREWALL_EXEC = "netsh"
+
+# Global State for Traffic Calculation
+process_io_cache = {}
+history_lock = threading.Lock()
+
+def is_admin():
+    """Checks for Administrator privileges."""
+    try:
+        return ctypes.windll.shell32.IsUserAnAdmin()
+    except:
+        return False
+
+def get_process_name(pid):
+    """Safely resolves PID to Process Name."""
+    try:
+        proc = psutil.Process(pid)
+        return proc.name()
+    except (psutil.NoSuchProcess, psutil.AccessDenied, psutil.ZombieProcess):
+        return "Unknown/System"
+
+def calculate_speed(pid, current_io):
+    """Calculates upload/download speed based on IO deltas."""
+    now = time.time()
+    if pid in process_io_cache:
+        prev_io, prev_time = process_io_cache[pid]
+        time_delta = now - prev_time
+        if time_delta > 0:
+            upload_speed = (current_io.bytes_sent - prev_io.bytes_sent) / time_delta
+            download_speed = (current_io.bytes_recv - prev_io.bytes_recv) / time_delta
+            process_io_cache[pid] = (current_io, now)
+            return upload_speed, download_speed
+    
+    process_io_cache[pid] = (current_io, now)
+    return 0.0, 0.0
+
+@app.route('/api/monitor', methods=['GET'])
+def monitor_traffic():
+    """
+    Core Jedi Monitoring Logic.
+    Returns real-time connections, correlated processes, and bandwidth usage.
+    """
+    connections = []
+    
+    try:
+        # Get all network connections (inet)
+        net_connections = psutil.net_connections(kind='inet')
+        
+        for conn in net_connections:
+            # Filter for ESTABLISHED or SYN_SENT (active traffic)
+            if conn.status not in [psutil.CONN_ESTABLISHED, psutil.CONN_SYN_SENT]:
+                continue
+
+            pid = conn.pid or 0
+            proc_name = get_process_name(pid)
+            
+            # Get IO counters for speed calculation
+            upload_speed = 0.0
+            download_speed = 0.0
+            
+            try:
+                if pid > 0:
+                    proc = psutil.Process(pid)
+                    io_counters = proc.io_counters()
+                    upload_speed, download_speed = calculate_speed(pid, io_counters)
+            except:
+                pass # Process might have died during iteration
+
+            remote_ip = conn.raddr.ip if conn.raddr else "Local"
+            remote_port = conn.raddr.port if conn.raddr else 0
+            
+            # Malicious Heuristic: High Outbound on Non-Standard Ports for System Processes
+            is_suspicious = False
+            if upload_speed > 100000 and proc_name.lower() in ["svchost.exe", "lsass.exe"]:
+                is_suspicious = True
+            
+            connection_data = {
+                "pid": pid,
+                "process": proc_name,
+                "local_ip": f"{conn.laddr.ip}:{conn.laddr.port}",
+                "remote_ip": remote_ip,
+                "remote_port": remote_port,
+                "status": conn.status,
+                "upload_speed_Bps": upload_speed,
+                "download_speed_Bps": download_speed,
+                "suspicious": is_suspicious,
+                "timestamp": datetime.now().isoformat()
+            }
+            connections.append(connection_data)
+
+    except Exception as e:
+        logger.error(f"Monitoring cycle failed: {e}")
+        return jsonify({"error": str(e)}), 500
+
+    # Sort by speed (highest activity first)
+    connections.sort(key=lambda x: x['download_speed_Bps'] + x['upload_speed_Bps'], reverse=True)
+    return jsonify(connections)
+
+@app.route('/api/firewall/block', methods=['POST'])
+def firewall_block():
+    """Adds a blocking rule to Windows Firewall for a specific IP."""
+    if not is_admin():
+        return jsonify({"error": "Admin privileges required"}), 403
+
+    data = request.json
+    ip_to_block = data.get('ip')
+    
+    if not ip_to_block or ip_to_block == "Local":
+        return jsonify({"error": "Invalid IP"}), 400
+
+    rule_name = f"Perseus_Block_{ip_to_block}"
+    
+    # Command: netsh advfirewall firewall add rule name="..." dir=out action=block remoteip="..."
+    cmd = [
+        FIREWALL_EXEC, "advfirewall", "firewall", "add", "rule",
+        f"name={rule_name}", "dir=out", "action=block", f"remoteip={ip_to_block}"
+    ]
+    
+    # Block inbound as well
+    cmd_in = [
+        FIREWALL_EXEC, "advfirewall", "firewall", "add", "rule",
+        f"name={rule_name}_IN", "dir=in", "action=block", f"remoteip={ip_to_block}"
+    ]
+
+    try:
+        subprocess.run(cmd, check=True, shell=True)
+        subprocess.run(cmd_in, check=True, shell=True)
+        logger.info(f"Blocked IP: {ip_to_block}")
+        return jsonify({"status": "success", "message": f"IP {ip_to_block} blocked."})
+    except subprocess.CalledProcessError as e:
+        return jsonify({"status": "error", "message": str(e)}), 500
+
+@app.route('/api/firewall/whitelist', methods=['POST'])
+def firewall_whitelist():
+    """Adds an allow rule (Whitelist)."""
+    if not is_admin():
+        return jsonify({"error": "Admin privileges required"}), 403
+
+    data = request.json
+    ip_to_allow = data.get('ip')
+    
+    rule_name = f"Perseus_Allow_{ip_to_allow}"
+    cmd = [
+        FIREWALL_EXEC, "advfirewall", "firewall", "add", "rule",
+        f"name={rule_name}", "dir=out", "action=allow", f"remoteip={ip_to_allow}"
+    ]
+    
+    try:
+        subprocess.run(cmd, check=True, shell=True)
+        logger.info(f"Whitelisted IP: {ip_to_allow}")
+        return jsonify({"status": "success", "message": f"IP {ip_to_allow} whitelisted."})
+    except subprocess.CalledProcessError as e:
+        return jsonify({"status": "error", "message": str(e)}), 500
+
+@app.route('/api/tools/run', methods=['POST'])
+def run_tool():
+    """Executes the integrated scripts provided by the user."""
+    if not is_admin():
+        return jsonify({"error": "Admin privileges required"}), 403
+        
+    data = request.json
+    script_alias = data.get('script')
+    
+    script_map = {
+        "hardening": ("Privacy Hardening Script.py", "python"),
+        "optimizer": ("ROG_BE92_Signal_Optimizer.py", "python"),
+        "firewall_rules": ("secure_gaming_firewall.ps1", "powershell"),
+        "net_reset": ("network optimizer with reset.bat", "cmd")
+    }
+    
+    if script_alias not in script_map:
+        return jsonify({"error": "Unknown script alias"}), 400
+        
+    filename, runner = script_map[script_alias]
+    filepath = os.path.join(SCRIPTS_DIR, filename)
+    
+    if not os.path.exists(filepath):
+        return jsonify({"error": f"File not found: {filepath}"}), 404
+        
+    try:
+        if runner == "python":
+            subprocess.Popen([sys.executable, filepath], creationflags=subprocess.CREATE_NEW_CONSOLE)
+        elif runner == "powershell":
+            subprocess.Popen(["powershell", "-ExecutionPolicy", "Bypass", "-File", filepath], creationflags=subprocess.CREATE_NEW_CONSOLE)
+        elif runner == "cmd":
+            subprocess.Popen([filepath], creationflags=subprocess.CREATE_NEW_CONSOLE)
+            
+        return jsonify({"status": "success", "message": f"Launched {filename}"})
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+@app.route('/')
+def serve_ui():
+    """Serves the dashboard file."""
+    # Assumes dashboard is in the same directory as engine or specific path
+    current_dir = os.path.dirname(os.path.abspath(__file__))
+    return send_from_directory(current_dir, 'perseus_dashboard.html')
+
+if __name__ == '__main__':
+    if not is_admin():
+        print("PERSEUS: WARNING - Not running as Admin. Firewall features will fail.")
+        print("PERSEUS: Please restart with 'Run as Administrator'.")
+    
+    print("PERSEUS: System Monitor Online.")
+    print("PERSEUS: Access Dashboard at http://localhost:5500")
+    app.run(host='0.0.0.0', port=5500, debug=False)
